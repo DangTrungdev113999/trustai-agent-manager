@@ -1,0 +1,14 @@
+{
+  "name": "agent-manager",
+  "private": true,
+  "scripts": {
+    "test": "vitest run",
+    "test:client": "cd client && npx vitest run",
+    "test:server": "cd server && npx vitest run"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "jsdom": "^28.1.0",
+    "vitest": "^4.1.0"
+  }
+}
