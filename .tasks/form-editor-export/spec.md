@@ -1,669 +1,589 @@
-# M1: Form Editor + Export — Technical Specification
+# M1: Form Editor + Export - Technical Specification
 
-## Scope
-Hybrid MD file editor for workspace files (SOUL.md, IDENTITY.md, AGENTS.md):
-- Parse MD → structured form data
-- Edit via React form + live MD preview
-- Generate MD from form state
-- Import/export workspace (.zip)
+## Overview
+Web UI để config OpenClaw agents qua GUI thay vì edit files thủ công. M1 scope: form editor + import/export workspace files.
 
-## 1. TypeScript Types
+## Architecture
+
+### Tech Stack
+- **Frontend:** React 18 + TypeScript + Vite
+- **UI Library:** shadcn/ui + TailwindCSS
+- **State:** React Context + localStorage
+- **Security:** DOMPurify (sanitize user input)
+- **Backend:** Node.js + Express
+- **File Processing:** JSZip (export), Multer (upload)
+
+### Ports
+- Frontend: 5187
+- Backend: 3015
+
+---
+
+## Data Types
+
+### Frontend Types
 
 ```typescript
-// Shared types (libs/types/workspace.ts)
-export interface WorkspaceFile {
-  filename: 'SOUL.md' | 'IDENTITY.md' | 'AGENTS.md';
-  content: string; // Raw markdown
-  parsedData: ParsedFileData;
+// shared/types/agent.ts
+
+interface AgentConfig {
+  id: string;
+  name: string;
+  role: string;
+  emoji: string;
+  vibe?: string;
+  rules: string; // markdown freeform
+  advancedMode: boolean; // toggle structured/freeform
+  rawSOUL?: string; // khi advanced mode = true
+  rawIDENTITY?: string;
+  rawAGENTS?: string;
+  createdAt: number;
+  updatedAt: number;
 }
 
-export interface ParsedFileData {
-  // IDENTITY.md
-  identity?: {
+interface AgentTemplate {
+  name: string;
+  role: string;
+  emoji: string;
+  vibe: string;
+  rules: string;
+}
+
+interface ImportValidationResult {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+  files: {
+    soul: string | null;
+    identity: string | null;
+    agents: string | null;
+  };
+}
+
+interface ExportBundle {
+  workspace: {
+    'SOUL.md': string;
+    'IDENTITY.md': string;
+    'AGENTS.md': string;
+    'README.txt': string;
+  };
+}
+```
+
+### Backend Types
+
+```typescript
+// server/types/agent.ts
+
+interface ParsedAgent {
+  name: string;
+  role: string;
+  emoji: string;
+  vibe?: string;
+  rules: string;
+}
+
+interface ValidationRules {
+  maxFileSize: number; // 10MB
+  requiredFiles: string[]; // ['SOUL.md', 'IDENTITY.md']
+  allowedExtensions: string[]; // ['.md', '.txt']
+}
+
+interface FileMetadata {
+  name: string;
+  size: number;
+  content: string;
+}
+```
+
+---
+
+## API Contracts
+
+### POST `/api/agent/parse`
+Parse uploaded workspace .zip và extract agent config.
+
+**Request:**
+```typescript
+Content-Type: multipart/form-data
+Body: {
+  file: File // .zip workspace
+}
+```
+
+**Response:**
+```typescript
+{
+  success: boolean;
+  data?: {
+    agent: ParsedAgent;
+    files: {
+      soul: string;
+      identity: string;
+      agents: string;
+    };
+  };
+  error?: {
+    code: 'FILE_TOO_LARGE' | 'MISSING_REQUIRED_FILES' | 'INVALID_FORMAT' | 'MALICIOUS_CONTENT';
+    message: string;
+    details?: string[];
+  };
+}
+```
+
+**Validation:**
+- File size <= 10MB
+- Contains `SOUL.md` + `IDENTITY.md` (required)
+- `AGENTS.md` optional (generate default if missing)
+- DOMPurify sanitize all markdown content
+- Reject if contains `<script>`, `<iframe>`, `javascript:`
+
+**Error Codes:**
+- `FILE_TOO_LARGE`: File > 10MB
+- `MISSING_REQUIRED_FILES`: Missing SOUL.md or IDENTITY.md
+- `INVALID_FORMAT`: Malformed markdown structure
+- `MALICIOUS_CONTENT`: Detected dangerous HTML/scripts
+
+---
+
+### POST `/api/agent/generate`
+Generate workspace files từ agent config.
+
+**Request:**
+```typescript
+{
+  agent: {
     name: string;
     role: string;
-    emoji: string; // Single Unicode emoji
-    vibe: string;
+    emoji: string;
+    vibe?: string;
+    rules: string;
   };
-  
-  // SOUL.md
-  soul?: {
-    language: string;
-    rules: string[]; // Numbered list items
-    planThreadBehavior?: string; // Freeform MD section
-    initProjectCommand?: string; // Parsed from exec block
-    milestoneWorkflow?: string; // Freeform MD section
-    teamMembers?: { name: string; mention: string }[];
+  advancedMode: boolean;
+  rawFiles?: {
+    soul?: string;
+    identity?: string;
+    agents?: string;
   };
-  
-  // AGENTS.md
-  agents?: {
-    firstRunInstructions?: string;
-    sessionStartChecklist?: string[];
-    memoryPolicy?: string;
-    safetyRules?: string[];
-    externalVsInternal?: string;
-    groupChatGuidelines?: string;
-    toolsNotes?: string;
-  };
-  
-  // Freeform sections (non-structured content)
-  freeformSections: { heading: string; content: string }[];
-}
-
-export interface WorkspaceExport {
-  version: '1.0';
-  files: WorkspaceFile[];
-  exportedAt: string; // ISO 8601
 }
 ```
 
-## 2. Backend API
-
-### 2.1 Endpoints
-
-**Parse workspace MD files:**
-```
-POST /api/workspace/parse
-Content-Type: multipart/form-data
-
-Body:
-- file: File (SOUL.md / IDENTITY.md / AGENTS.md)
-
-Response 200:
-{
-  "filename": "SOUL.md",
-  "parsedData": ParsedFileData,
-  "warnings": string[] // e.g., "Unknown heading: ## Custom Section"
-}
-
-Error 400:
-{
-  "error": "INVALID_FILE",
-  "message": "File must be .md and <= 10MB"
-}
-
-Error 429:
-{
-  "error": "RATE_LIMIT_EXCEEDED",
-  "message": "Max 10 parse requests per minute",
-  "retryAfter": 42 // seconds
-}
-```
-
-**Generate MD from form data:**
-```
-POST /api/workspace/generate
-Content-Type: application/json
-
-Body:
-{
-  "filename": "SOUL.md",
-  "parsedData": ParsedFileData
-}
-
-Response 200:
-{
-  "filename": "SOUL.md",
-  "content": string // Generated markdown
-}
-```
-
-**Export workspace as .zip:**
-```
-POST /api/workspace/export
-Content-Type: application/json
-
-Body:
-{
-  "files": WorkspaceFile[]
-}
-
-Response 200:
-Content-Type: application/zip
-Content-Disposition: attachment; filename="workspace-export-2026-03-15.zip"
-
-Binary .zip containing:
-- SOUL.md
-- IDENTITY.md
-- AGENTS.md
-- manifest.json (metadata: version, exportedAt)
-
-Error 400:
-{
-  "error": "INVALID_FILE_COUNT",
-  "message": "Must include all 3 workspace files"
-}
-
-Error 400:
-{
-  "error": "EMPTY_WORKSPACE",
-  "message": "Cannot export empty workspace"
-}
-```
-
-**Import workspace from .zip:**
-```
-POST /api/workspace/import
-Content-Type: multipart/form-data
-
-Body:
-- file: File (.zip <= 10MB)
-
-Response 200:
-{
-  "files": WorkspaceFile[],
-  "warnings": string[]
-}
-
-Error 400:
-{
-  "error": "INVALID_ZIP",
-  "message": "Missing required file: SOUL.md"
-}
-
-Error 429:
-{
-  "error": "RATE_LIMIT_EXCEEDED",
-  "message": "Max 5 import requests per minute",
-  "retryAfter": 30
-}
-```
-
-### 2.2 Validation Rules
-
-| Field | Rule |
-|-------|------|
-| File size | <= 10MB per file |
-| Emoji (IDENTITY.md) | Single Unicode emoji, trimmed (use `emoji-regex` lib) |
-| Filename | Exact match: `SOUL.md`, `IDENTITY.md`, `AGENTS.md` (case-sensitive) |
-| .zip structure | Must contain all 3 MD files + optional manifest.json |
-| MD content | Valid UTF-8, no null bytes |
-| Freeform heading | Non-empty after trim, no `##` prefix (auto-stripped) |
-
-### 2.3 Rate Limiting
-
-| Endpoint | Limit | Window | Identifier |
-|----------|-------|--------|------------|
-| `/api/workspace/parse` | 10 requests | 1 minute | Client IP |
-| `/api/workspace/import` | 5 requests | 1 minute | Client IP |
-| `/api/workspace/generate` | 20 requests | 1 minute | Client IP |
-| `/api/workspace/export` | 10 requests | 1 minute | Client IP |
-
-**Concurrent handling:**
-- Use request queue per IP (max 2 concurrent)
-- Additional requests → HTTP 503 "Server busy, retry in 5s"
-
-### 2.4 MD Parser Logic
-
-**Parsing strategy:**
-1. Split by `## Heading` to extract sections
-2. Known headings → structured fields (e.g., `## Rules` → `soul.rules[]`)
-3. Unknown headings → `freeformSections[]`
-4. Preserve original formatting (whitespace, list styles)
-5. **Sanitize freeform headings:** Strip leading `##`, trim whitespace, escape markdown special chars in heading text
-
-**Example: SOUL.md**
-```markdown
-# Marcus — Architect @ TrustAI
-
-Tiếng Việt (trừ code). Ngắn gọn.
-
-## Rules
-1. KHÔNG paste bash ra Discord
-2. LUÔN dùng `<@ID>` mention
-
-## PLAN thread — Brainstorm
-- Research trước khi review
-- Alex confirm → Marcus tạo M1
-```
-
-**Parsed:**
-```json
-{
-  "soul": {
-    "language": "Tiếng Việt (trừ code). Ngắn gọn.",
-    "rules": [
-      "KHÔNG paste bash ra Discord",
-      "LUÔN dùng `<@ID>` mention"
-    ]
-  },
-  "freeformSections": [
-    {
-      "heading": "PLAN thread — Brainstorm",
-      "content": "- Research trước khi review\n- Alex confirm → Marcus tạo M1"
-    }
-  ]
-}
-```
-
-**Team table parsing:**
-- Ignore empty rows (`| | |` → skip)
-- Require both columns non-empty (name + mention)
-- Invalid rows → warning: "Skipped empty team row"
-
-### 2.5 MD Generator Logic
-
-**Generation strategy:**
-1. Render structured fields → known headings
-2. Append `freeformSections[]` as-is
-3. Preserve user formatting (list styles, code blocks)
-4. Add blank line between sections
-5. **Escape freeform headings:** Re-add `##` prefix, sanitize heading text
-
-**Example output:**
-```markdown
-# Marcus — Architect @ TrustAI
-
-Tiếng Việt (trừ code). Ngắn gọn.
-
-## Rules
-1. KHÔNG paste bash ra Discord
-2. LUÔN dùng `<@ID>` mention
-
-## PLAN thread — Brainstorm
-- Research trước khi review
-- Alex confirm → Marcus tạo M1
-```
-
-## 3. Frontend (React)
-
-### 3.1 Components
-
-**WorkspaceEditor.tsx:**
-- Tabs: SOUL.md | IDENTITY.md | AGENTS.md
-- Split view: Form (left) + MD Preview (right)
-- Auto-save to local state on field change
-- Export/Import buttons (top-right toolbar)
-  - Export: disabled if all files empty
-  - Import: show warning modal if form has unsaved edits
-- **Concurrent operation guard:** Disable Export/Import buttons during active parse/generate requests
-
-**StructuredForm.tsx:**
-- Dynamic fields based on `parsedData` schema
-- Text inputs, textareas, emoji picker
-- List editor for arrays (`soul.rules[]`, `soul.teamMembers[]`)
-- **States:**
-  - Loading: skeleton loaders for fields
-  - Error: red border + inline error message
-  - Default: editable fields
-
-**FreeformSection.tsx:**
-- Textarea for each `freeformSections[i].content`
-- Collapsible sections (heading as label, collapsed by default if >5 sections)
-- "Add Section" button
-  - Validation: heading required (show error if empty on blur)
-  - Default heading: "Untitled Section"
-- **M1 scope:** No drag-to-reorder (hardcoded section order = parse order)
-
-**MDPreview.tsx:**
-- Read-only rendered markdown (use `react-markdown`)
-- **M1 scope:** No scroll-sync with form (independent scrollbars)
-
-### 3.2 File Upload Flow
-
-**Import:**
-1. User clicks "Import Workspace"
-2. **If form has edits:** Show modal: "Discard unsaved changes?" → Cancel | Proceed
-3. File picker → select .zip
-4. Show loading overlay: "Processing..."
-5. **Disable Export/Import buttons** (prevent concurrent requests)
-6. POST `/api/workspace/import`
-7. On success: Load `files[]` into editor state, switch to SOUL.md tab, re-enable buttons
-8. On error: Show toast notification + error message, re-enable buttons
-
-**Export:**
-1. User clicks "Export Workspace"
-2. **If all files empty:** Button disabled, tooltip: "Add content to export"
-3. **If parse in progress:** Button disabled, tooltip: "Processing..."
-4. Collect current form state → `WorkspaceFile[]`
-5. **Disable Export/Import buttons**
-6. POST `/api/workspace/export`
-7. Browser download .zip, re-enable buttons
-
-### 3.3 Validation UI
-
-- Show field errors inline (red border + message)
-- Toast notifications for API errors (rate limit, server errors)
-- Disable Export if:
-  - All files have empty `parsedData` + empty `freeformSections[]`
-  - Any file has validation errors (invalid emoji, empty required fields)
-  - Active parse/import operation in progress
-
-## 4. Test Scenarios
-
-### 4.1 Parser Tests
-
-| Test | Input | Expected Output |
-|------|-------|----------------|
-| Parse SOUL.md | Valid MD with Rules + Team | `soul.rules[]` populated, `soul.teamMembers[]` extracted |
-| Unknown heading | `## Custom Section` | Appears in `freeformSections[]` |
-| Empty file | `""` | `{ freeformSections: [] }` (no error) |
-| Oversized file | 11MB MD file | Error: `INVALID_FILE` |
-| Empty table row | `\| \| \|` in Team table | Row skipped, warning: "Skipped empty team row" |
-| Freeform heading with `##` | User enters `## My ## Section` | Parsed as heading "My ## Section" (## stripped) |
-
-### 4.2 Generator Tests
-
-| Test | Input | Expected Output |
-|------|-------|----------------|
-| Generate from parsed data | `soul.rules = ["Rule 1", "Rule 2"]` | `## Rules\n1. Rule 1\n2. Rule 2` |
-| Preserve freeform | `freeformSections[0]` | Exact content appended |
-| Empty data | `{ freeformSections: [] }` | Empty MD string |
-
-### 4.3 Import/Export Tests
-
-| Test | Input | Expected Output |
-|------|-------|----------------|
-| Valid .zip | Contains all 3 MD files | `files[]` populated |
-| Missing file | .zip without AGENTS.md | Error: `INVALID_ZIP` |
-| Oversized .zip | 11MB .zip | Error: `INVALID_FILE` |
-| Export → Import (1 roundtrip) | Export workspace → import same .zip | Identical `parsedData` |
-| Export → Import → Export (2 roundtrips) | Repeat export/import twice | Byte-identical content after both rounds |
-
-### 4.4 UI Tests
-
-| Test | Action | Expected Behavior |
-|------|--------|-------------------|
-| Edit field | Change `soul.language` → type "English" | MD preview updates instantly |
-| Add freeform section | Click "Add Section" → leave heading empty | Error: "Heading required" on blur |
-| Import workspace | Upload .zip | Editor loads files, switches to SOUL.md tab |
-| Import with unsaved edits | Edit form → click Import | Modal: "Discard unsaved changes?" |
-| Export workspace | Click Export | Browser downloads `workspace-export-YYYY-MM-DD.zip` |
-| Export empty workspace | No content in any file → click Export | Button disabled |
-| Validation error | Enter invalid emoji "🔥🔥" | Red border + error message |
-| Rate limit hit | 11th parse request in 1 min | Toast: "Too many requests, retry in 30s" |
-| Concurrent operation guard | Upload file → click Export immediately | Export button disabled until parse completes |
-
-### 4.5 Security Tests
-
-| Test | Input | Expected Output |
-|------|-------|----------------|
-| XSS in MD | `SOUL.md` contains `<script>alert('xss')</script>` | Preview shows escaped text (no script execution) |
-| Zip bomb | 1MB .zip expands to 200MB | Error: `ZIP_TOO_LARGE` (extracted size > 50MB) |
-| Path traversal | .zip contains `../../../etc/passwd` | File ignored, warning: "Invalid filename" |
-| Compression ratio | 100KB .zip expands to 20MB | Accepted (ratio 200:1 under threshold) |
-| Rate limit (parse) | 11 parse requests in 1 min | 11th request → 429 error, `Retry-After: 30` |
-| Concurrent requests | 3 import requests sent simultaneously | 2 processed, 1 queued → 503 "Server busy" |
-| Emoji trailing space | `validateEmoji("⚙️ ")` | Passes (trimmed before validation) |
-
-### 4.6 Edge Case Tests
-
-| Test | Input | Expected Output |
-|------|-------|----------------|
-| Multi-codepoint emoji | `👨👩👧👦` in emoji field | Accepted (visually one emoji) |
-| Emoji + text | `Marcus ⚙️` | Error: "Emoji must be standalone" |
-| 100 freeform sections | SOUL.md with 100 `## Custom N` headings | All parsed, UI collapses by default |
-| Empty freeform section | `## Custom\n\n` (no content) | Preserved in `freeformSections[]` |
-| Freeform heading with `##` | `## My ## Section` → parse → generate | Roundtrip preserves: `## My ## Section` |
-| Empty freeform heading (UI) | User adds section, leaves heading blank | Error on blur: "Heading required" |
-| Empty team table row | `\| \| \|` in Team table | Row skipped, warning logged |
-
-### 4.7 Roundtrip Tests
-
-| Test | Action | Expected Behavior |
-|------|--------|-------------------|
-| Parse → generate (1 roundtrip) | Load SOUL.md → export → compare | Byte-identical (whitespace preserved) |
-| Edit freeform → roundtrip | Add text to custom section → export → import | Text preserved, section order unchanged |
-| 2 roundtrips | Export → import → export → import → compare | Byte-identical after both rounds |
-
-### 4.8 Browser Compatibility Tests
-
-| Browser | Test | Expected Behavior |
-|---------|------|-------------------|
-| Chrome 120+ | Export workspace → download .zip | File downloads to default folder |
-| Safari 17+ | Export workspace → download .zip | File downloads, no MIME type errors |
-| Firefox 121+ | Export workspace → download .zip | File downloads, correct filename |
-| Edge 120+ | Import .zip | File picker opens, .zip accepted |
-
-**Minimum supported versions:**
-- Chrome/Edge: 120+
-- Safari: 17+
-- Firefox: 121+
-- Mobile browsers: Not supported (M1 desktop-only)
-
-## 5. Tech Stack
-
-| Layer | Tech |
-|-------|------|
-| BE | Express, `gray-matter` (MD frontmatter), `emoji-regex` (validation), `express-rate-limit` |
-| FE | React 18, `react-markdown`, `emoji-picker-react`, `DOMPurify` (XSS sanitization) |
-| Storage | None (in-memory only for M1) |
-| Tests | Jest (BE), Vitest (FE), Playwright (E2E browser compatibility) |
-
-## 6. Non-Goals (M1)
-
-- ❌ Multi-user editing (single-user only)
-- ❌ Version history / undo
-- ❌ Cloud storage (local export/import only)
-- ❌ Real-time collaboration
-- ❌ Auto-save to backend (all state in FE until export)
-- ❌ Scroll-sync between form and preview (M2 feature)
-- ❌ Drag-to-reorder freeform sections (M2 feature)
-- ❌ Mobile browser support (desktop-only)
-
-## 7. Success Criteria
-
-- [ ] Parse all 3 workspace MD files without errors
-- [ ] Generate MD from form → matches original formatting
-- [ ] Import/export roundtrip preserves data (no data loss, 2+ roundtrips tested)
-- [ ] Form validation prevents invalid emoji/oversized files
-- [ ] MD preview syncs with form edits in <100ms
-- [ ] Rate limiting blocks excessive requests (429 error)
-- [ ] Concurrent operation guard prevents race conditions
-- [ ] All test scenarios pass (30+ test cases)
-- [ ] Browser compatibility: Chrome 120+, Safari 17+, Firefox 121+, Edge 120+
-
-## 8. UX States
-
-### 8.1 WorkspaceEditor States
-
-| State | Trigger | UI |
-|-------|---------|-----|
-| Empty | Initial load, no files | "Import workspace to start" placeholder |
-| Loading | Import in progress | Spinner overlay + "Processing..." |
-| Error | Import/parse failed | Error banner + retry button |
-| Default | Files loaded | Form + preview visible |
-| Unsaved changes | User edits form | "Unsaved changes" indicator (dot on tab) |
-| Operation in progress | Parse/import active | Export/Import buttons disabled |
-
-### 8.2 StructuredForm States
-
-| State | Trigger | UI |
-|-------|---------|-----|
-| Loading | File upload parsing | Skeleton loaders for all fields |
-| Error | Validation failed (e.g., invalid emoji) | Red border + inline error message |
-| Default | Data loaded, no errors | Editable fields |
-
-### 8.3 MDPreview States
-
-| State | Trigger | UI |
-|-------|---------|-----|
-| Loading | Generating preview | Skeleton loader |
-| Error | Generation failed | "Preview unavailable" message |
-| Default | MD rendered | Scrollable markdown (independent scroll) |
-
-### 8.4 Export Button States
-
-| State | Trigger | UI |
-|-------|---------|-----|
-| Disabled | All files empty (no content) | Grayed out, tooltip: "Add content to export" |
-| Disabled | Operation in progress | Grayed out, tooltip: "Processing..." |
-| Enabled | At least one file has content + no active operations | Clickable, blue background |
-
-### 8.5 Import Button States
-
-| State | Trigger | UI |
-|-------|---------|-----|
-| Warning | User has unsaved form edits | Modal on click: "Discard unsaved changes? Cancel \| Proceed" |
-| Disabled | Operation in progress | Grayed out, tooltip: "Processing..." |
-| Default | No unsaved edits + no active operations | File picker opens immediately |
-
-## 9. Security Measures
-
-### 9.1 XSS Prevention
-- **MD Preview:** Use `react-markdown` with `disallowedElements={['script', 'iframe']}` + `DOMPurify` sanitization
-- **User input:** Escape HTML in form fields before rendering
-
-### 9.2 Zip Extraction
-- **Compressed size:** <= 10MB
-- **Extracted size limit:** <= 50MB total (all files combined)
-- **Path validation:** Strip directory paths, only allow base filenames (`SOUL.md`, not `../SOUL.md`)
-- **Zip bomb detection:** Reject if compression ratio > 100:1
-
-### 9.3 File Validation
-- **MD content:** Strip null bytes, validate UTF-8 encoding
-- **Filename whitelist:** Only `SOUL.md`, `IDENTITY.md`, `AGENTS.md`, `manifest.json`
-
-### 9.4 Rate Limiting
-- **Per-IP limits:** See §2.3 table
-- **Concurrent request queue:** Max 2 concurrent requests per IP
-- **429 response:** Include `Retry-After` header (seconds)
-
-### 9.5 Emoji Validation Edge Cases
-**Implementation:**
+**Response:**
 ```typescript
-import emojiRegex from 'emoji-regex';
-
-function validateEmoji(input: string): boolean {
-  const trimmed = input.trim(); // Handle trailing/leading spaces
-  const regex = emojiRegex();
-  const matches = trimmed.match(regex);
-  return matches !== null && matches.length === 1 && trimmed === matches[0];
+{
+  success: boolean;
+  data?: {
+    files: {
+      'SOUL.md': string;
+      'IDENTITY.md': string;
+      'AGENTS.md': string;
+      'README.txt': string;
+    };
+  };
+  error?: {
+    code: 'VALIDATION_ERROR';
+    message: string;
+  };
 }
 ```
 
-**Test cases:**
-- `validateEmoji("⚙️ ")` → `true` (trailing space trimmed)
-- `validateEmoji(" 🔥")` → `true` (leading space trimmed)
-- `validateEmoji("🔥🔥")` → `false` (two emojis)
+**File Generation Logic:**
 
-## 10. Clarifications
-
-### 10.1 Emoji Validation
-**Rule:** Single **rendered** emoji only (multi-codepoint allowed if visually one emoji)
-
-**Examples:**
-- ✅ `⚙️` (single codepoint with variation selector)
-- ✅ `👨👩👧👦` (multi-codepoint, but visually one family emoji)
-- ❌ `🔥🔥` (two separate emojis)
-- ❌ `Marcus ⚙️` (text + emoji)
-
-### 10.2 Team Members Parsing
-**SOUL.md table format:**
+**SOUL.md Template:**
 ```markdown
-## Team
-| Member | Mention |
-|--------|---------|
-| Marcus | `<@1480799610283884608>` |
-| Alex   | `<@1480799502536540323>` |
-|        |         |
+# {name} {emoji}
+
+- **Role:** {role}
+
+## Rules
+{rules}
 ```
 
-**Parser logic:**
-1. Detect `## Team` heading
-2. Find markdown table (rows with `|`)
-3. Extract rows: `{ name: column1.trim(), mention: column2.trim() }`
-4. **Skip empty rows:** If `name.trim() === "" || mention.trim() === ""` → skip, add warning
-5. Strip backticks from mention field
+**IDENTITY.md Template:**
+```markdown
+# IDENTITY.md
 
-### 10.3 Freeform Section Order
-**Guarantee:** Parse → generate roundtrip preserves:
-- Section order (heading sequence)
-- Content formatting (whitespace, lists)
-- Heading levels (`##` vs `###`)
+- **Name:** {name}
+- **Role:** {role}
+- **Emoji:** {emoji}
+- **Vibe:** {vibe || "Professional, precise, technical"}
+```
 
-**UI behavior:**
-- Freeform sections: collapsible (collapsed by default if >5 sections)
-- **M1:** Section order = parse order (no drag-to-reorder UI)
-- **M2:** Add drag handles for reordering
+**AGENTS.md Template:**
+```markdown
+# AGENTS.md - Your Workspace
 
-### 10.4 Freeform Heading Sanitization
-**Input:** User enters heading with markdown chars: `My ## Special ## Section`
+This folder is home. Treat it that way.
 
-**Parser behavior:**
-1. Strip leading `##` if present: `My ## Special ## Section` → `My ## Special ## Section`
-2. Trim whitespace
-3. Escape inner `##` when rendering in UI (show as text, not heading)
+## First Run
 
-**Generator behavior:**
-1. Add `## ` prefix to heading
-2. Output: `## My ## Special ## Section`
+If `BOOTSTRAP.md` exists, that's your birth certificate. Follow it, figure out who you are, then delete it. You won't need it again.
 
-**Roundtrip test:**
-- Original MD: `## My ## Special ## Section`
-- Parse → `{ heading: "My ## Special ## Section", ... }`
-- Generate → `## My ## Special ## Section`
-- **Result:** Byte-identical ✅
+## Every Session
 
-### 10.5 Scroll-Sync (M1 Exclusion)
-**Decision:** M1 does not implement scroll-sync between form and preview.
+Before doing anything else:
 
-**Rationale:**
-- Adds complexity (scroll event listeners, viewport calculations)
-- Not critical for MVP (users can manually scroll)
-- Better suited for M2 polish pass
+1. Read `SOUL.md` — this is who you are
+2. Read `USER.md` — this is who you're helping
+3. Read `memory/YYYY-MM-DD.md` (today + yesterday) for recent context
 
-**M1 behavior:**
-- Form and preview have independent scrollbars
-- No synchronization
+Don't ask permission. Just do it.
+```
 
-**M2 plan:**
-- Use `scroll-sync` library or custom implementation
-- Scroll form → preview follows (and vice versa)
+**README.txt Template:**
+```
+OpenClaw Agent Workspace - {name}
 
-### 10.6 Drag-to-Reorder (M1 Exclusion)
-**Decision:** M1 does not implement drag-to-reorder for freeform sections.
+Setup Instructions:
+1. Unzip this folder to: ~/.openclaw/workspace-{name-lowercase}/
+2. Configure OpenClaw to load this workspace
+3. Run: openclaw session start --workspace {name-lowercase}
 
-**Rationale:**
-- Requires drag-and-drop library (`react-beautiful-dnd` or similar)
-- Not critical for MVP (section order = parse order is acceptable)
-- Better suited for M2 feature pass
+Generated by TrustAI Agent Manager
+{timestamp}
+```
 
-**M1 behavior:**
-- Freeform sections appear in parse order
-- No drag handles or reorder UI
+---
 
-**M2 plan:**
-- Add drag handles to section headers
-- Use `react-beautiful-dnd` for reordering
-- Update `freeformSections[]` order on drop
+### POST `/api/agent/validate`
+Validate agent config trước khi export.
 
-## 11. API Error Codes
+**Request:**
+```typescript
+{
+  name: string;
+  role: string;
+  emoji: string;
+  rules: string;
+}
+```
 
-| Code | Message | HTTP |
-|------|---------|------|
-| `INVALID_FILE` | File must be .md and <= 10MB | 400 |
-| `INVALID_ZIP` | Missing required file: SOUL.md | 400 |
-| `ZIP_TOO_LARGE` | Extracted size exceeds 50MB | 400 |
-| `INVALID_EMOJI` | Emoji must be standalone and single | 400 |
-| `EMPTY_WORKSPACE` | Cannot export empty workspace | 400 |
-| `RATE_LIMIT_EXCEEDED` | Too many requests, retry later | 429 |
-| `SERVER_BUSY` | Server busy, retry in 5s | 503 |
-| `PARSE_ERROR` | Failed to parse markdown | 500 |
-| `GENERATE_ERROR` | Failed to generate markdown | 500 |
+**Response:**
+```typescript
+{
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+```
 
-## 12. Coverage Matrix
+**Validation Rules:**
+- `name`: Required, 1-50 chars, alphanumeric + spaces
+- `role`: Required, 1-100 chars
+- `emoji`: Required, single emoji
+- `rules`: Required, min 10 chars, sanitized markdown
 
-Maps decisions.md requirements → spec implementation:
+**Warnings (không block export):**
+- Rules quá ngắn (<50 chars)
+- Không có headings trong Rules
+- Missing vibe field
 
-| Decision Requirement | Spec Section | Status |
-|---------------------|--------------|--------|
-| Form editor for SOUL.md, IDENTITY.md, AGENTS.md | §1 Types, §3.1 Components | ✅ |
-| Parse MD files | §2.1 `/api/workspace/parse` | ✅ |
-| Generate MD files | §2.1 `/api/workspace/generate` | ✅ |
-| Form validation + preview | §3.1 StructuredForm, MDPreview | ✅ |
-| Export .zip workspace | §2.1 `/api/workspace/export` | ✅ |
-| Import .zip workspace | §2.1 `/api/workspace/import` | ✅ |
-| LocalStorage (no cloud) | §6 Non-Goals | ✅ |
-| Max 10MB file size | §2.2 Validation Rules | ✅ |
-| No secrets in export | §6 Non-Goals (user adds manually) | ✅ |
-| UX states (loading/error) | §8 UX States | ✅ |
-| Security (rate limit, XSS) | §9 Security Measures | ✅ |
-| Edge cases (emoji, roundtrips) | §4.6, §4.7 Edge Case + Roundtrip Tests | ✅ |
-| Concurrent operation guard | §3.1 WorkspaceEditor, §4.4 UI Tests | ✅ |
-| Browser compatibility | §4.8 Browser Compatibility Tests | ✅ |
-| Scroll-sync exclusion (M1) | §6 Non-Goals, §10.5 Clarifications | ✅ |
-| Drag-to-reorder exclusion (M1) | §6 Non-Goals, §10.6 Clarifications | ✅ |
+---
 
-**Full Coverage:** All M1 decisions + Nova's review gaps + clarifications implemented.
+## Frontend Components
+
+### Core Pages
+
+**1. Dashboard (`/`)**
+- Empty state: "Create New Agent" button + "Load Example" dropdown
+- Agents list (nếu có trong localStorage):
+  - Card view: Name, Emoji, Role
+  - Actions: Edit, Delete, Export
+- Search/filter agents
+
+**2. Editor (`/editor/:id?`)**
+- **Structured Mode** (default):
+  - Text inputs: Name, Role, Emoji, Vibe
+  - Markdown editor: Rules section (với preview tab)
+  - Toggle "Advanced Mode" button
+- **Advanced Mode** (toggle):
+  - 3 tabs: SOUL.md, IDENTITY.md, AGENTS.md
+  - Freeform textarea cho mỗi file
+  - Syntax highlighting (nice-to-have, not MVP)
+- Actions:
+  - Save (localStorage)
+  - Export .zip
+  - Reset
+
+**3. Import (`/import`)**
+- Drag-and-drop zone or file picker
+- Upload progress bar
+- Validation errors/warnings display
+- Success → redirect to Editor with loaded config
+
+---
+
+### Component Tree
+
+```
+App
+├─ Dashboard
+│  ├─ EmptyState
+│  ├─ AgentCard (multiple)
+│  └─ SearchBar
+├─ Editor
+│  ├─ StructuredForm
+│  │  ├─ TextField (Name, Role, Emoji, Vibe)
+│  │  └─ MarkdownEditor (Rules)
+│  ├─ AdvancedEditor (tabs)
+│  │  ├─ SOULTab (textarea)
+│  │  ├─ IDENTITYTab (textarea)
+│  │  └─ AGENTSTab (textarea)
+│  └─ ActionBar (Save, Export, Reset)
+└─ Import
+   ├─ FileUpload (drag-drop)
+   ├─ ValidationDisplay
+   └─ LoadingSpinner
+```
+
+---
+
+### State Management
+
+**AgentContext:**
+```typescript
+interface AgentContextType {
+  agents: AgentConfig[];
+  currentAgent: AgentConfig | null;
+  loadAgents: () => void;
+  saveAgent: (agent: AgentConfig) => void;
+  deleteAgent: (id: string) => void;
+  setCurrentAgent: (id: string) => void;
+  exportAgent: (id: string) => Promise<Blob>;
+  importAgent: (file: File) => Promise<ImportValidationResult>;
+}
+```
+
+**localStorage Schema:**
+```typescript
+{
+  "trustai-agents": {
+    "version": 1,
+    "agents": AgentConfig[],
+    "lastUpdated": number
+  }
+}
+```
+
+---
+
+## Security
+
+### Input Sanitization
+
+**1. DOMPurify Configuration:**
+```typescript
+import DOMPurify from 'isomorphic-dompurify';
+
+const sanitizeMarkdown = (content: string): string => {
+  return DOMPurify.sanitize(content, {
+    ALLOWED_TAGS: ['p', 'br', 'strong', 'em', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'code', 'pre', 'blockquote'],
+    ALLOWED_ATTR: [],
+    FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'form'],
+    FORBID_ATTR: ['onerror', 'onclick', 'onload']
+  });
+};
+```
+
+**2. Upload Validation:**
+- Max file size: 10MB
+- Allowed MIME types: `application/zip`, `application/x-zip-compressed`
+- Virus scan: Skip MVP (add in M3)
+- Path traversal check: reject files with `../` in paths
+
+**3. XSS Prevention:**
+- All user input sanitized before render
+- CSP headers:
+  ```
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'
+  ```
+
+---
+
+## Test Scenarios
+
+### Unit Tests
+
+**Backend:**
+1. **Parse SOUL.md:**
+   - Input: Valid SOUL.md → extract name, role, emoji, rules
+   - Input: Missing ## Rules → return error
+   - Input: Empty file → return error
+
+2. **Generate workspace:**
+   - Input: Valid AgentConfig → generate SOUL.md, IDENTITY.md, AGENTS.md, README.txt
+   - Output: Files match templates
+   - Output: Variables replaced correctly ({name}, {emoji}, etc.)
+
+3. **Sanitization:**
+   - Input: `<script>alert('XSS')</script>` in rules → stripped
+   - Input: `javascript:void(0)` in markdown → stripped
+   - Input: `<iframe src="evil.com">` → stripped
+
+**Frontend:**
+4. **Form validation:**
+   - Empty name → show error
+   - Emoji field với text "smile" → warning (not a valid emoji)
+   - Rules < 10 chars → show error
+
+5. **localStorage:**
+   - Save agent → retrieve same config
+   - Delete agent → removed from list
+   - Multiple agents → all persist correctly
+
+### Integration Tests
+
+6. **Import flow:**
+   - Upload valid .zip → parse success, load into editor
+   - Upload .zip > 10MB → reject with FILE_TOO_LARGE
+   - Upload .zip missing SOUL.md → reject with MISSING_REQUIRED_FILES
+   - Upload .zip with malicious `<script>` → sanitize and show warning
+
+7. **Export flow:**
+   - Export agent → download .zip
+   - Unzip → contains SOUL.md, IDENTITY.md, AGENTS.md, README.txt
+   - SOUL.md content matches editor input
+
+8. **Advanced mode toggle:**
+   - Structured mode → Advanced mode → textarea shows generated SOUL.md
+   - Edit textarea → toggle back → warning "Switching will discard freeform edits"
+
+### E2E Tests
+
+9. **Full workflow:**
+   - Create new agent → fill form → save
+   - Export → download .zip
+   - Delete agent
+   - Import same .zip → reload config
+   - Verify all fields match original
+
+10. **Edge cases:**
+    - Create agent with emoji "🤖" → export → import → emoji preserved
+    - Create agent with markdown in rules (headings, lists, code blocks) → export → import → formatting preserved
+    - Import workspace with only SOUL.md + IDENTITY.md (no AGENTS.md) → generate default AGENTS.md
+
+### Performance Tests
+
+11. **Large agent:**
+    - Rules = 10,000 chars markdown → save → export → import within 2s
+
+12. **Multiple agents:**
+    - localStorage with 50 agents → load dashboard < 500ms
+
+---
+
+## Error Handling
+
+### User-Facing Errors
+
+| Scenario | Error Message | Action |
+|----------|---------------|--------|
+| File too large | "File exceeds 10MB limit. Please reduce size or split into multiple agents." | Show in import dialog |
+| Missing SOUL.md | "Invalid workspace: SOUL.md is required." | Show in import dialog |
+| Malicious content | "Workspace contains unsafe content. Potentially dangerous tags have been removed." | Show warning, allow import with sanitized content |
+| Empty form fields | "Name, Role, and Emoji are required." | Highlight empty fields |
+| Invalid emoji | "Please enter a single emoji character." | Show inline error |
+
+### Developer Errors
+
+| Scenario | Log Level | Action |
+|----------|-----------|--------|
+| localStorage quota exceeded | ERROR | Show toast: "Storage full. Please delete old agents." |
+| Network error (import) | ERROR | Retry button + "Check your connection" |
+| Unzip failed | ERROR | "Invalid .zip file. Please re-download or export again." |
+
+---
+
+## Deployment
+
+### Build Steps
+
+**Frontend:**
+```bash
+cd client
+npm install
+npm run build
+# Output: client/dist/
+```
+
+**Backend:**
+```bash
+cd server
+npm install
+npm run build
+# Output: server/dist/
+```
+
+### Environment Variables
+
+```bash
+# server/.env
+PORT=3015
+MAX_FILE_SIZE=10485760 # 10MB in bytes
+CORS_ORIGIN=http://localhost:5187
+
+# client/.env
+VITE_API_URL=http://localhost:3015
+```
+
+### Docker (Optional - not MVP)
+
+```dockerfile
+# server/Dockerfile
+FROM node:18-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY dist ./dist
+EXPOSE 3015
+CMD ["node", "dist/index.js"]
+```
+
+---
+
+## Out of Scope (M2/M3)
+
+**M2 - Flow Visualization:**
+- Interactive graph showing agent routing
+- Table view of agent interactions
+
+**M3 - Advanced Features:**
+- Batch import (multiple agents)
+- Version control (agent config history)
+- Sharing agents (public URL)
+- Cloud sync (Firebase/Supabase)
+
+---
+
+## Success Criteria
+
+✅ **M1 Complete When:**
+1. User can create agent via structured form
+2. User can toggle advanced mode and edit raw markdown
+3. User can export agent as .zip workspace
+4. User can import .zip and reload agent config
+5. All validation errors handled gracefully
+6. Security: XSS/script injection blocked
+7. All test scenarios pass (unit + integration)
+
+---
+
+## Timeline Estimate
+
+- **Spec review:** 1 day
+- **BE setup + API:** 2 days
+- **FE setup + UI components:** 3 days
+- **Integration + testing:** 2 days
+- **Bug fixes + polish:** 1 day
+
+**Total:** ~9 days (1.5 weeks)
+
+---
+
+## Questions for Review
+
+1. **AGENTS.md template:** Có cần customize per agent hay dùng chung 1 template?
+2. **localStorage limit:** 50 agents có quá nhiều? Có cần pagination?
+3. **Markdown editor:** Dùng library nào? (react-markdown-editor-lite, SimpleMDE, or textarea + preview?)
+4. **Advanced mode warning:** "Switching will discard edits" → có cần confirmation modal hay inline warning?
+
