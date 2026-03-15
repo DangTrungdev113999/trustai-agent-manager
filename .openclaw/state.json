@@ -1,0 +1,18 @@
+{
+  "project": "agent-manager",
+  "github": "git@github.com:DangTrungdev113999/trustai-agent-manager.git",
+  "channel_id": null,
+  "status": "PLANNING",
+  "current_milestone": null,
+  "milestones": [],
+  "ports": {
+    "backend": 3015,
+    "frontend": 5187,
+    "tunnel_url": null
+  },
+  "last_activity": {
+    "agent": null,
+    "action": null,
+    "timestamp": null
+  }
+}
